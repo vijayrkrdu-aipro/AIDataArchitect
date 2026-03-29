@@ -1,0 +1,21 @@
+# Environment / credentials
+.env
+*.env
+.env.*
+
+# Claude Code local settings (may contain credentials)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
