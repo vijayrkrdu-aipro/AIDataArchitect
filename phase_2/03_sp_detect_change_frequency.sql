@@ -5,8 +5,10 @@
 --
 -- Strategy (priority order):
 --   1. Snapshot comparison — looks for companion _HIST/_SNAP table in the
---      same database.schema, with a date/timestamp column
---   2. Semantic classification — column name pattern matching (fallback)
+--      same database.schema, joins on the confirmed/best PK from
+--      META.DV_PK_CANDIDATES, compares column values across two snapshots.
+--   2. Semantic classification — column name pattern matching (fallback).
+--      Covers generic DV patterns + demographics domain vocabulary.
 --
 -- Call: CALL META.SP_DETECT_CHANGE_FREQUENCY('your-run-id');
 -- Returns: summary of classifications applied
@@ -22,6 +24,7 @@ PACKAGES = ('snowflake-snowpark-python')
 HANDLER = 'run'
 COMMENT = 'Classifies column change frequency (FAST/SLOW/STATIC) for a profiling run. Reads source database from the run record.'
 AS $$
+import json as _json
 
 def run(session, run_id: str) -> str:
 
@@ -37,7 +40,7 @@ def run(session, run_id: str) -> str:
     static_count = 0
     snap_used    = False
 
-    # ── Resolve run context (reads database from the run record) ─────────────
+    # ── Resolve run context ───────────────────────────────────────────────────
 
     run_info = session.sql(f"""
         SELECT SOURCE_DATABASE, SOURCE_SCHEMA, SOURCE_TABLE
@@ -52,7 +55,6 @@ def run(session, run_id: str) -> str:
     source_schema   = run_info[0]['SOURCE_SCHEMA']
     source_table    = run_info[0]['SOURCE_TABLE']
 
-    # If SOURCE_DATABASE was NULL (pre-migration rows), fall back to current db
     if not source_database.strip():
         source_database = session.sql("SELECT CURRENT_DATABASE() AS D").collect()[0]['D']
 
@@ -61,7 +63,24 @@ def run(session, run_id: str) -> str:
 
     q_db     = qi(source_database)
     s_schema = source_schema.replace("'",  "''")
-    s_db     = source_database.replace("'","''")
+
+    # ── Resolve PK columns from DV_PK_CANDIDATES ─────────────────────────────
+    # Prefer modeler-confirmed; fall back to highest-scoring auto-detected
+
+    pk_cols = []
+    pk_rows = session.sql(f"""
+        SELECT COLUMN_NAMES::VARCHAR AS COLS
+        FROM META.DV_PK_CANDIDATES
+        WHERE RUN_ID = '{s_run_id}'
+        ORDER BY MODELER_SELECTED DESC, PK_SCORE DESC
+        LIMIT 1
+    """).collect()
+
+    if pk_rows:
+        try:
+            pk_cols = _json.loads(pk_rows[0]['COLS'])
+        except Exception:
+            pk_cols = []
 
     # ── Strategy 1: Snapshot comparison ──────────────────────────────────────
 
@@ -78,7 +97,7 @@ def run(session, run_id: str) -> str:
             snap_table = candidate
             break
 
-    if snap_table:
+    if snap_table and pk_cols:
         # Find a date/timestamp column in the snapshot table
         date_cols = session.sql(f"""
             SELECT COLUMN_NAME
@@ -107,6 +126,10 @@ def run(session, run_id: str) -> str:
                 dt1 = str(snap_dates[0]['SNAP_DT'])
                 dt2 = str(snap_dates[1]['SNAP_DT'])
 
+                # Build PK join condition and SELECT list
+                pk_select   = ", ".join(qi(c) for c in pk_cols)
+                join_clause = " AND ".join(f"a.{qi(c)} = b.{qi(c)}" for c in pk_cols)
+
                 profiled_cols = session.sql(f"""
                     SELECT COLUMN_NAME FROM META.DV_PROFILING_RESULTS
                     WHERE RUN_ID = '{s_run_id}'
@@ -114,7 +137,18 @@ def run(session, run_id: str) -> str:
 
                 for col_row in profiled_cols:
                     col_name = col_row['COLUMN_NAME']
-                    qcol     = qi(col_name)
+
+                    # Skip PK columns themselves — always static by definition
+                    if col_name.upper() in [c.upper() for c in pk_cols]:
+                        session.sql(f"""
+                            UPDATE META.DV_PROFILING_RESULTS
+                            SET CHANGE_FREQUENCY = 'STATIC'
+                            WHERE RUN_ID = '{s_run_id}' AND COLUMN_NAME = {esc(col_name)}
+                        """).collect()
+                        static_count += 1
+                        continue
+
+                    qcol = qi(col_name)
 
                     # Check column exists in snapshot table
                     col_in_snap = session.sql(f"""
@@ -128,20 +162,20 @@ def run(session, run_id: str) -> str:
                     if not col_in_snap:
                         continue
 
-                    # Compare values across the two snapshots
+                    # Compare values across snapshots using PK join
                     change_result = session.sql(f"""
                         SELECT
-                            COUNT(*)                                                          AS TOTAL_ROWS,
-                            SUM(IFF(a.{qcol}::VARCHAR != b.{qcol}::VARCHAR, 1, 0))           AS CHANGED_ROWS
+                            COUNT(*)                                                                    AS TOTAL_ROWS,
+                            SUM(IFF(a.{qcol}::VARCHAR IS DISTINCT FROM b.{qcol}::VARCHAR, 1, 0))       AS CHANGED_ROWS
                         FROM
-                            (SELECT {qcol} FROM {full_snap} WHERE {q_snap_dt}::DATE = '{dt1}') a
-                        FULL OUTER JOIN
-                            (SELECT {qcol} FROM {full_snap} WHERE {q_snap_dt}::DATE = '{dt2}') b
-                          ON a.{qcol}::VARCHAR = b.{qcol}::VARCHAR
+                            (SELECT {pk_select}, {qcol} FROM {full_snap} WHERE {q_snap_dt}::DATE = '{dt1}') a
+                        INNER JOIN
+                            (SELECT {pk_select}, {qcol} FROM {full_snap} WHERE {q_snap_dt}::DATE = '{dt2}') b
+                          ON {join_clause}
                     """).collect()[0]
 
-                    total_r   = change_result['TOTAL_ROWS']   or 0
-                    changed_r = change_result['CHANGED_ROWS'] or 0
+                    total_r    = change_result['TOTAL_ROWS']   or 0
+                    changed_r  = change_result['CHANGED_ROWS'] or 0
                     change_pct = (changed_r / total_r * 100) if total_r > 0 else 0
 
                     if   change_pct > 20: freq = 'FAST';   fast_count   += 1
@@ -157,19 +191,44 @@ def run(session, run_id: str) -> str:
                 snap_used = True
 
     # ── Strategy 2: Semantic classification ──────────────────────────────────
-    # Applies to all columns still NULL (snapshot not available or column absent)
+    # Applies to columns still NULL (no snapshot, no PK, or column absent in snap)
 
     unclassified = session.sql(f"""
         SELECT COLUMN_NAME FROM META.DV_PROFILING_RESULTS
         WHERE RUN_ID = '{s_run_id}' AND CHANGE_FREQUENCY IS NULL
     """).collect()
 
-    fast_suffixes   = ('_AMT','_BAL','_RATE','_QTY','_CNT','_COUNT','_STAT','_STATUS',
-                       '_FLG','_FLAG','_PRC','_PRICE','_PCT','_PERCENT','_TTL','_TOTAL')
-    slow_suffixes   = ('_NM','_NAME','_ADDR','_ADDRESS','_TYP','_TYPE','_CD','_CODE',
-                       '_DESCR','_DESC','_LBL','_LABEL','_CTGY','_CATG','_CATEGORY')
-    static_keywords = ('_ID','_KEY','_NBR','_NUM','_SSN','_TIN','_DOB','BIRTH',
-                       '_OPEN_DT','_CREAT','_SETUP','_INIT','_ORIG')
+    # FAST — values expected to change frequently
+    fast_suffixes = (
+        '_AMT',   '_BAL',    '_RATE',   '_QTY',    '_CNT',    '_COUNT',
+        '_STAT',  '_STATUS', '_FLG',    '_FLAG',   '_PRC',    '_PRICE',
+        '_PCT',   '_PERCENT','_TTL',    '_TOTAL',
+        # demographics — frequently updated scores / assessments
+        '_SCORE', '_RATING', '_INDEX',  '_RANK',   '_RISK',
+        '_INCOME','_SALARY', '_EARN',   '_WAGES',
+        '_EMPLOY','_JOB',    '_OCCUP',  '_WORK',
+    )
+
+    # SLOW — attributes that change infrequently
+    slow_suffixes = (
+        '_NM',    '_NAME',   '_ADDR',   '_ADDRESS','_TYP',    '_TYPE',
+        '_CD',    '_CODE',   '_DESCR',  '_DESC',   '_LBL',    '_LABEL',
+        '_CTGY',  '_CATG',   '_CATEGORY',
+        # demographics — stable personal/geographic attributes
+        '_RACE',  '_ETHNIC', '_GENDER', '_SEX',    '_MARITAL','_MRTL',
+        '_EDUC',  '_SCHOOL', '_LANG',   '_LANGUAGE','_RELIG', '_NATION',
+        '_CITIZEN','_ZIP',   '_POSTAL', '_STATE',  '_CITY',   '_COUNTY',
+        '_REGION','_DISTRICT','_METRO',
+    )
+
+    # STATIC — identifiers and immutable facts
+    static_keywords = (
+        '_ID',    '_KEY',    '_NBR',    '_NUM',    '_SSN',    '_TIN',
+        '_DOB',   'BIRTH',   '_OPEN_DT','_CREAT',  '_SETUP',  '_INIT',
+        '_ORIG',
+        # demographics — immutable identifiers / birth facts
+        '_SIN',   '_NIN',    '_PASSPORT','_BORN',  '_BIRTH_DT',
+    )
 
     for col_row in unclassified:
         col_name = col_row['COLUMN_NAME']
@@ -182,7 +241,7 @@ def run(session, run_id: str) -> str:
         elif any(s in cu for s in static_keywords):
             freq = 'STATIC'; static_count += 1
         else:
-            freq = 'SLOW';   slow_count   += 1  # default: assume slow-changing
+            freq = 'SLOW';   slow_count   += 1  # conservative default
 
         session.sql(f"""
             UPDATE META.DV_PROFILING_RESULTS
@@ -190,7 +249,7 @@ def run(session, run_id: str) -> str:
             WHERE RUN_ID = '{s_run_id}' AND COLUMN_NAME = {esc(col_name)}
         """).collect()
 
-    method = 'snapshot comparison' if snap_used else 'semantic classification'
+    method = 'snapshot comparison (PK join)' if snap_used else 'semantic classification'
     return (f"Change frequency classified via {method}: "
             f"FAST={fast_count}, SLOW={slow_count}, STATIC={static_count}")
 

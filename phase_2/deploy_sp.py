@@ -2,6 +2,13 @@
 import snowflake.connector
 import os
 
+# Load .env from the project root (two levels up from this file)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+except ImportError:
+    pass  # dotenv not installed — fall back to environment variables
+
 ACCOUNT   = os.environ["SNOWFLAKE_ACCOUNT"]
 USER      = os.environ["SNOWFLAKE_USER"]
 PASSWORD  = os.environ["SNOWFLAKE_PASSWORD"]
@@ -25,64 +32,19 @@ conn = snowflake.connector.connect(
 )
 cs = conn.cursor()
 
-def split_statements(sql):
-    """Split a SQL file into individual statements on '$$;' or ';' boundaries."""
-    # Split on the Snowflake $$ end marker + semicolon
-    import re
-    # Handle AS $$ ... $$; blocks first
-    parts = re.split(r'(\$\$\s*;)', sql)
-    statements = []
-    buf = ""
-    for part in parts:
-        if re.match(r'\$\$\s*;', part):
-            buf += "$$"
-            stmt = buf.strip()
-            if stmt:
-                statements.append(stmt)
-            buf = ""
-        else:
-            # Within a non-$$ block, split on bare semicolons
-            # but only if we're not inside a $$ block
-            sub = part.split(';')
-            for i, s in enumerate(sub):
-                if i < len(sub) - 1:
-                    full = (buf + s).strip()
-                    if full:
-                        statements.append(full)
-                    buf = ""
-                else:
-                    buf = buf + s
-    if buf.strip():
-        statements.append(buf.strip())
-    return [s for s in statements if s]
+def run_file(connection, fpath):
+    """Execute every statement in a SQL file using execute_string (handles $$ blocks)."""
+    with open(fpath, 'r', encoding='utf-8') as f:
+        sql = f.read()
+    for result in connection.execute_string(sql, remove_comments=True):
+        pass  # consume all result sets
 
 try:
     for fname in SP_FILES:
         fpath = os.path.join(PHASE2_DIR, fname)
         print(f"\nDeploying {fname}...")
-        with open(fpath, 'r', encoding='utf-8') as f:
-            sql = f.read()
-
-        # Execute as a single statement (CREATE OR REPLACE PROCEDURE ... AS $$...$$)
-        # Strip comment lines and find the CREATE statement
-        # The whole file is one big statement ending with $$;
-        # Just execute it directly
-        try:
-            cs.execute(sql)
-            print(f"  OK — {cs.fetchone()}")
-        except Exception as e:
-            # Try splitting and running each statement
-            stmts = [s.strip() for s in sql.split(';\n') if s.strip() and not s.strip().startswith('--')]
-            for i, stmt in enumerate(stmts):
-                stmt = stmt.rstrip(';').strip()
-                if not stmt or stmt.startswith('--'):
-                    continue
-                try:
-                    cs.execute(stmt)
-                    print(f"  Statement {i+1}: OK")
-                except Exception as e2:
-                    print(f"  Statement {i+1} ERROR: {e2}")
-                    raise
+        run_file(conn, fpath)
+        print(f"  OK")
 
     print("\nAll stored procedures deployed successfully.")
 

@@ -97,8 +97,8 @@ CREATE OR REPLACE TABLE META.DV_ENTITY_COLUMN (
     COLUMN_ROLE         VARCHAR(20)                 NOT NULL,   -- HK, BK, HASHDIFF, META, ATTR, FK_HK, MAK
     ORDINAL_POSITION    INT,
     IS_NULLABLE         BOOLEAN                     DEFAULT TRUE,
-    COLUMN_DEFINITION   VARCHAR(1000),
-    SOURCE_COLUMN       VARCHAR(100),                           -- originating source column name
+    COLUMN_DEFINITION   VARCHAR(2000),
+    SOURCE_COLUMN       VARCHAR(2000),                          -- originating source column name (or hash description for HASHDIFF)
     CREATED_DATE        TIMESTAMP_NTZ               DEFAULT CURRENT_TIMESTAMP(),
     -- NOTE: Valid COLUMN_ROLE values enforced at application layer: HK, BK, HASHDIFF, META, ATTR, FK_HK, MAK
     CONSTRAINT PK_DV_ENTITY_COLUMN PRIMARY KEY (COLUMN_ID),

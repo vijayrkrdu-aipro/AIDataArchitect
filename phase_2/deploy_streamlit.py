@@ -5,6 +5,13 @@ Fixes the [Errno 21] Is a directory error by uploading to stage root (no path su
 import snowflake.connector
 import os
 
+# Load .env from the project root (two levels up from this file)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+except ImportError:
+    pass  # dotenv not installed — fall back to environment variables
+
 ACCOUNT   = os.environ["SNOWFLAKE_ACCOUNT"]
 USER      = os.environ["SNOWFLAKE_USER"]
 PASSWORD  = os.environ["SNOWFLAKE_PASSWORD"]

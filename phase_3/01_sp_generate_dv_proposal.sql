@@ -159,15 +159,33 @@ def run(session,
             "",
             "COLUMN PROFILING RESULTS:",
         ]
+
+        # For very wide tables (>60 cols) suppress top_values and pattern
+        # to keep the prompt within token budget.
+        wide_table = len(prof_rows) > 60
+        if wide_table:
+            profiling_lines.append(
+                f"  NOTE: Wide table ({len(prof_rows)} columns). "
+                "Top-values and pattern detail omitted to save space. "
+                "Focus on column names and data types for classification.")
+
         for r in prof_rows:
             pk_flag = " *** PK CANDIDATE ***" if r['IS_PK_CANDIDATE'] else ""
-            line = (f"  {r['ORDINAL_POSITION']}. {r['COLUMN_NAME']}"
-                    f" | src:{r['SOURCE_DATA_TYPE']} inferred:{r['INFERRED_DATA_TYPE']}"
-                    f" | uniq:{r['UNIQ_PCT']}% null:{r['NULL_PCT']}%"
-                    f" | chg:{r['CHANGE_FREQUENCY'] or '?'}"
-                    f" | pattern:{r['PATTERN_DETECTED'] or 'none'}"
-                    f" | top:{r['TOP_VALS'] or '[]'}"
-                    f"{pk_flag}")
+            if wide_table:
+                # Compact format for wide tables
+                line = (f"  {r['ORDINAL_POSITION']}. {r['COLUMN_NAME']}"
+                        f" | {r['SOURCE_DATA_TYPE']}"
+                        f" | uniq:{r['UNIQ_PCT']}% null:{r['NULL_PCT']}%"
+                        f" | chg:{r['CHANGE_FREQUENCY'] or '?'}"
+                        f"{pk_flag}")
+            else:
+                line = (f"  {r['ORDINAL_POSITION']}. {r['COLUMN_NAME']}"
+                        f" | src:{r['SOURCE_DATA_TYPE']} inferred:{r['INFERRED_DATA_TYPE']}"
+                        f" | uniq:{r['UNIQ_PCT']}% null:{r['NULL_PCT']}%"
+                        f" | chg:{r['CHANGE_FREQUENCY'] or '?'}"
+                        f" | pattern:{r['PATTERN_DETECTED'] or 'none'}"
+                        f" | top:{r['TOP_VALS'] or '[]'}"
+                        f"{pk_flag}")
             profiling_lines.append(line)
 
         if pk_rows:
@@ -214,7 +232,60 @@ def run(session,
                 "NOTE: No profiling or column metadata available. Infer from table name only."
             )
 
-    # ── 6. Build user message ─────────────────────────────────────────────────
+    # ── 6. Query approved column definitions from internal store ─────────────
+    # These persist across sessions and work for datashares/read-only sources.
+    approved_col_defs_section = ""
+    try:
+        src_sch = source_schema or (
+            session.sql(f"""
+                SELECT SOURCE_SCHEMA FROM META.DV_PROFILING_RUN
+                WHERE RUN_ID = '{safe(run_id or "")}'
+                LIMIT 1
+            """).collect()[0]['SOURCE_SCHEMA'] if run_id else None
+        )
+        if src_sch:
+            def_rows = session.sql(f"""
+                SELECT COLUMN_NAME, DEFINITION, IS_SENSITIVE, TABLE_DESCRIPTION
+                FROM META.DV_COLUMN_DEFINITIONS
+                WHERE SOURCE_SCHEMA = '{safe(src_sch)}'
+                  AND SOURCE_TABLE  = '{safe(source_table)}'
+                ORDER BY COLUMN_NAME
+            """).collect()
+        else:
+            def_rows = session.sql(f"""
+                SELECT COLUMN_NAME, DEFINITION, IS_SENSITIVE, TABLE_DESCRIPTION
+                FROM META.DV_COLUMN_DEFINITIONS
+                WHERE SOURCE_TABLE = '{safe(source_table)}'
+                ORDER BY COLUMN_NAME
+            """).collect()
+
+        if def_rows:
+            def_lines   = [f"  {r['COLUMN_NAME']}: {r['DEFINITION']}"
+                           for r in def_rows if r['DEFINITION']]
+            sens_lines  = [f"  {r['COLUMN_NAME']}: {r['IS_SENSITIVE']}"
+                           for r in def_rows
+                           if r['IS_SENSITIVE'] and r['IS_SENSITIVE'] not in ('None', None)]
+            tbl_desc    = next((r['TABLE_DESCRIPTION'] for r in def_rows
+                                if r['TABLE_DESCRIPTION']), None)
+            parts = []
+            if tbl_desc:
+                parts.append(f"TABLE DESCRIPTION: {tbl_desc}")
+            if def_lines:
+                parts.append(
+                    "APPROVED COLUMN DEFINITIONS — USE THESE VERBATIM as column_definition "
+                    "values in the vault JSON. Do not rephrase or shorten.\n"
+                    + "\n".join(def_lines))
+            if sens_lines:
+                parts.append("SENSITIVE COLUMNS:\n" + "\n".join(sens_lines))
+            if parts:
+                approved_col_defs_section = (
+                    "\n=== APPROVED COLUMN DEFINITIONS FROM NEXUS REGISTRY ===\n"
+                    + "\n\n".join(parts)
+                    + "\n=== END APPROVED COLUMN DEFINITIONS ===")
+    except Exception:
+        pass
+
+    # ── 7. Build user message ─────────────────────────────────────────────────
     if modeler_notes and modeler_notes.strip():
         notes_text = modeler_notes.strip()
         modeler_notes_section = f"""=== MODELER NOTES — READ THIS FIRST AND APPLY TO EVERY DECISION ===
@@ -234,6 +305,7 @@ Instructions for using these notes:
     user_message = f"""Generate a Data Vault 2.0 Raw Vault design proposal for the source table below.
 
 {modeler_notes_section}
+{approved_col_defs_section}
 
 {registry_context}
 
@@ -245,20 +317,35 @@ INSTRUCTIONS:
 1. Read the MODELER NOTES above before doing anything else. Apply every instruction in them.
 2. Check the EXISTING APPROVED REGISTRY for hub reuse opportunities before creating any new hub.
 3. Apply the satellite simplification guardrails: consolidate where possible, avoid over-splitting.
-4. Apply all naming conventions: SAT_<NOUN>_<DESC>__<SRC> with max 5-char source code.
-5. Include BATCH_ID in every entity's column list.
-6. In each entity rationale, state explicitly whether modeler notes, statistics, or name heuristics drove the decision.
-7. Return ONLY the JSON object — no markdown fences, no explanation outside the JSON."""
+4. Apply entity naming conventions: SAT_<SRCCODE>_<NOUN>_<DESC> — source system code comes FIRST after SAT_, single underscore throughout. Max 5-char source code. Same pattern for MSAT and ESAT. Examples: SAT_ACCTS_CUSTOMER_DETAILS, MSAT_ACCTS_CUSTOMER_PHONE, ESAT_ACCTS_ACCOUNT_CUSTOMER.
+5. CRITICAL — SOURCE COLUMN NAMES: For every attribute (column_role: ATTR) and business key (column_role: BK) column,
+   the "column_name" field MUST be identical to the source column name as it appears in the profiling data.
+   Do NOT abbreviate, rename, translate, or transform attribute or business key column names.
+   Only vault-generated metadata columns (HK, HASHDIFF, LOAD_DTS, REC_SRC) use vault naming conventions.
+   The "source_column" field must also be set to the exact source column name.
+6. Include BATCH_ID in every entity's column list.
+7. In each entity rationale, state explicitly whether modeler notes, statistics, or name heuristics drove the decision.
+8. APPROVED COLUMN DEFINITIONS: If the section "APPROVED COLUMN DEFINITIONS FROM NEXUS REGISTRY" is present above,
+   copy those definitions verbatim into the column_definition field of the matching ATTR or BK columns.
+   Do NOT paraphrase, shorten, or rewrite them. These are modeler-reviewed and approved.
+9. Keep column_definition values SHORT (10 words max) for columns without an approved definition.
+   For wide tables with many columns, omit column_definition entirely rather than writing long descriptions.
+10. Return ONLY the JSON object — no markdown fences, no explanation outside the JSON."""
 
     # ── 7. Call Cortex AI_COMPLETE ─────────────────────────────────────────────
-    # Use parameterized binding — avoids all dollar-quoting and size issues.
+    # max_tokens inlined as a literal (not a bind param) — Snowflake requires
+    # the options object to be a literal or OBJECT_CONSTRUCT, not PARSE_JSON(?).
     messages_json = json.dumps([
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_message}
     ], ensure_ascii=True)
 
     ai_row = session.sql(
-        "SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(?, PARSE_JSON(?))::VARCHAR AS AI_RESPONSE",
+        """SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
+               ?,
+               PARSE_JSON(?),
+               OBJECT_CONSTRUCT('max_tokens', 20000, 'temperature', 0)
+           )::VARCHAR AS AI_RESPONSE""",
         params=["claude-opus-4-6", messages_json]
     ).collect()
 
@@ -267,23 +354,178 @@ INSTRUCTIONS:
     ai_text = (ai_row[0]['AI_RESPONSE'] or '').strip() if ai_row else ''
 
     # ── 8. Parse AI response ──────────────────────────────────────────────────
-    if ai_text:
-        # Strip markdown code fences if AI wrapped in them
-        if ai_text.startswith('```'):
-            ai_text = re.sub(r'^```(?:json)?\s*', '', ai_text, flags=re.MULTILINE)
-            ai_text = re.sub(r'\s*```\s*$',        '', ai_text, flags=re.MULTILINE)
-        ai_text = ai_text.strip()
+    def _extract_json_object(text):
+        """
+        Extract the outermost {...} from text using balanced-brace matching,
+        skipping over strings so braces inside string values are ignored.
+        More reliable than rfind('}') when text has trailing content.
+        """
+        start = text.find('{')
+        if start == -1:
+            return text
+        depth = 0
+        in_str = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escaped:
+                escaped = False
+                continue
+            if ch == '\\' and in_str:
+                escaped = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        # Fell off the end — return everything from start (malformed but try anyway)
+        return text[start:]
+
+    def _repair_truncated(text):
+        """
+        If the JSON was cut off mid-stream (unterminated string / unexpected EOF),
+        walk back from the end to find the last position that completed a full
+        value at depth >= 1, then close all open brackets/braces.
+
+        Handles two truncation cases:
+          1. Truncated mid-string — close the open string with '"', strip
+             the partial key/value, then close open scopes.
+          2. Truncated at a bracket boundary — trim to last safe position
+             and close open scopes.
+        """
+        stack     = []   # '{' or '[' for each open scope
+        in_str    = False
+        escaped   = False
+        last_safe = 0    # byte offset after the last cleanly closed value
+        str_start = -1   # where the current open string started
+
+        for i, ch in enumerate(text):
+            if escaped:
+                escaped = False
+                continue
+            if ch == '\\' and in_str:
+                escaped = True
+                continue
+            if ch == '"':
+                if in_str:
+                    in_str    = False
+                    str_start = -1
+                    # A closing quote at depth >= 1 is a safe point only if
+                    # the next non-space char is : , } ] (i.e. complete value)
+                    # — we record it conservatively below via the comma/bracket logic
+                else:
+                    in_str    = True
+                    str_start = i
+                continue
+            if in_str:
+                continue
+            if ch in ('{', '['):
+                stack.append(ch)
+            elif ch in ('}', ']'):
+                if stack:
+                    stack.pop()
+                if stack:
+                    last_safe = i + 1
+            elif ch == ',' and stack:
+                last_safe = i + 1   # just after comma = clean boundary
+
+        if not stack and not in_str:
+            return text   # already balanced
+
+        if in_str:
+            # Truncated mid-string: roll back to the last safe bracket boundary
+            # (dropping the partial string and its key if present)
+            text = text[:last_safe].rstrip().rstrip(',')
+            # Re-derive the remaining open stack from the trimmed text
+            stack2, in_s2, esc2 = [], False, False
+            for ch in text:
+                if esc2:            esc2 = False; continue
+                if ch == '\\' and in_s2: esc2 = True; continue
+                if ch == '"':       in_s2 = not in_s2; continue
+                if in_s2:           continue
+                if ch in ('{','['): stack2.append(ch)
+                elif ch in ('}',']') and stack2: stack2.pop()
+            stack = stack2
+        else:
+            # Truncated at a bracket boundary — trim to last clean position
+            text = text[:last_safe].rstrip().rstrip(',')
+
+        for opener in reversed(stack):
+            text += ']' if opener == '[' else '}'
+        return text
+
+    def _parse_ai_json(text):
+        """Robustly parse AI-generated JSON with layered fallbacks."""
+        # Strip markdown fences
+        text = re.sub(r'```(?:json)?\s*', '', text)
+        text = re.sub(r'```',             '', text)
+        text = text.strip()
+
+        # Extract outermost {...} via balanced-brace walk
+        text = _extract_json_object(text)
+
+        last_err = "unknown parse error"
+
+        # Pass 1: standard parse
         try:
-            proposal_data = json.loads(ai_text)
-        except Exception as parse_err:
+            return json.loads(text), None
+        except Exception as e1:
+            last_err = str(e1)
+
+        # Pass 2: fix trailing commas
+        t2 = re.sub(r',(\s*[}\]])', r'\1', text)
+        try:
+            return json.loads(t2), None
+        except Exception as e2:
+            last_err = str(e2)
+
+        # Pass 3: Python literals → JSON booleans/null
+        t3 = re.sub(r'\bTrue\b',  'true',  t2)
+        t3 = re.sub(r'\bFalse\b', 'false', t3)
+        t3 = re.sub(r'\bNone\b',  'null',  t3)
+        try:
+            return json.loads(t3), None
+        except Exception as e3:
+            last_err = str(e3)
+
+        # Pass 4: truncation recovery — close any open braces/brackets then retry
+        t4 = _repair_truncated(t3)
+        t4 = re.sub(r',(\s*[}\]])', r'\1', t4)   # trailing commas on repaired text
+        try:
+            result = json.loads(t4)
+            # Mark that we recovered from truncation so a warning is attached
+            if isinstance(result, dict):
+                result.setdefault('warnings', []).append(
+                    'AI response was truncated and partially recovered. '
+                    'Some columns or entities near the end may be missing. '
+                    'Consider re-generating.')
+            return result, None
+        except Exception as e4:
+            last_err = str(e4)
+
+        return None, last_err
+
+    if ai_text:
+        parsed, parse_err = _parse_ai_json(ai_text)
+        if parsed is not None:
+            proposal_data = parsed
+        else:
+            # Store first 8000 chars of raw response for UI diagnosis
             proposal_data = {
                 "confidence_overall": "INFERRED",
                 "input_scenario":     input_scenario,
-                "warnings":           [f"AI response could not be parsed as JSON: {str(parse_err)[:200]}",
-                                       "Raw response stored. Manual review required."],
+                "warnings":           [f"AI response could not be parsed as JSON: {(parse_err or '')[:500]}",
+                                       f"Raw response length: {len(ai_text)} chars. Manual review required."],
                 "hubs": [], "links": [], "satellites": [],
                 "hash_definitions": [],
-                "_raw_ai_response": ai_text[:2000]
+                "_raw_ai_response": ai_text[:8000]
             }
     else:
         # AI returned empty response

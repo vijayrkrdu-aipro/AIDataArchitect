@@ -42,9 +42,9 @@ VALUES
 |---------------------|------------------------------------------------------|------------------------------------------|
 | Hub                 | HUB_<BUSINESS_NOUN>                                  | HUB_CUSTOMER                             |
 | Link                | LNK_<NOUN1>_<NOUN2> (alphabetical order)             | LNK_ACCOUNT_CUSTOMER                     |
-| Satellite           | SAT_<PARENT_NOUN>_<DESCRIPTOR>__<SOURCE_SYSTEM>      | SAT_CUSTOMER_DETAILS__ACCT_SYS           |
-| Multi-Active Sat    | MSAT_<PARENT_NOUN>_<DESCRIPTOR>__<SOURCE_SYSTEM>     | MSAT_CUSTOMER_PHONE__CRM_SYS             |
-| Effectivity Sat     | ESAT_<LINK_NAME>__<SOURCE_SYSTEM>                    | ESAT_ACCOUNT_CUSTOMER__ACCT_SYS          |
+| Satellite           | SAT_<SOURCE_SYSTEM>_<PARENT_NOUN>_<DESCRIPTOR>       | SAT_ACCTS_CUSTOMER_DETAILS               |
+| Multi-Active Sat    | MSAT_<SOURCE_SYSTEM>_<PARENT_NOUN>_<DESCRIPTOR>      | MSAT_ACCTS_CUSTOMER_PHONE                |
+| Effectivity Sat     | ESAT_<SOURCE_SYSTEM>_<LINK_NAME>                     | ESAT_ACCTS_ACCOUNT_CUSTOMER              |
 | PIT Table           | PIT_<HUB_NAME>                                       | PIT_CUSTOMER                             |
 | Bridge Table        | BRG_<BUSINESS_CONCEPT>                               | BRG_CUSTOMER_ACCOUNT                     |
 
@@ -60,19 +60,20 @@ Rules:
 | Column Role      | Pattern                        | Data Type        | Example                   |
 |------------------|--------------------------------|------------------|---------------------------|
 | Hash Key         | <NOUN>_HK                      | BINARY(32)       | CUSTOMER_HK               |
-| Business Key     | Abbreviated form               | Source-dependent | CUST_ID, ACCT_NBR         |
+| Business Key     | Exact source column name       | Source-dependent | CUSTOMER_ID, ACCOUNT_NBR  |
 | Hashdiff         | <ENTITY_SHORT_NAME>_HASHDIFF   | BINARY(32)       | SAT_CUST_DTL_HASHDIFF     |
 | Load Timestamp   | LOAD_DTS                       | TIMESTAMP_NTZ    | LOAD_DTS                  |
 | Record Source    | REC_SRC                        | VARCHAR(100)     | REC_SRC                   |
 | Effectivity From | EFF_FROM_DTS                   | TIMESTAMP_NTZ    | EFF_FROM_DTS              |
 | Effectivity To   | EFF_TO_DTS                     | TIMESTAMP_NTZ    | EFF_TO_DTS                |
-| Multi-Active Key | Abbreviated descriptor         | Source-dependent | PHNE_TYP_CD               |
-| Attribute        | Abbreviated descriptor         | Source-dependent | FRST_NM, EMAIL_ADDR       |
+| Multi-Active Key | Exact source column name       | Source-dependent | PHONE_TYPE_CD             |
+| Attribute        | Exact source column name       | Source-dependent | FIRST_NAME, EMAIL_ADDRESS |
 
 Rules:
-- Column names use UPPER_SNAKE_CASE
+- Column names use UPPER_SNAKE_CASE for vault metadata columns (HK, HASHDIFF, LOAD_DTS, REC_SRC)
+- ATTRIBUTE and BUSINESS KEY columns must use the EXACT source column name — do not abbreviate or rename
 - Apply UPPER(TRIM()) transformation before hashing
-- Expand abbreviations when naming logical columns, but keep physical names abbreviated
+- logical_name may use expanded/readable form; column_name must match the source
 $$, '1.0');
 
 -- ── SECTION 3: HASH STANDARDS ─────────────────────────────────────────────
@@ -276,7 +277,7 @@ You MUST return a single valid JSON object — no markdown, no explanation outsi
           "column_definition": "SHA2_BINARY(256) hash of CUST_ID. Primary key."
         },
         {
-          "column_name": "CUST_ID",
+          "column_name": "CUSTOMER_ID",
           "logical_name": "Customer Identifier",
           "data_type": "VARCHAR(50)",
           "column_role": "BK",
