@@ -306,20 +306,69 @@ You MUST return a single valid JSON object — no markdown, no explanation outsi
   ],
   "links": [
     {
-      "entity_id": "LNK_ACCOUNT_CUSTOMER",
+      "entity_id": "LNK_ACCT_CUST",
       "is_new": true,
       "domain": "ACCOUNT",
-      "logical_name": "Account to Customer Relationship Link",
-      "hash_key_name": "ACCOUNT_CUSTOMER_HK",
+      "logical_name": "Account to Customer Relationship",
+      "hash_key_name": "ACCT_CUST_HK",
       "participating_hubs": ["HUB_ACCOUNT", "HUB_CUSTOMER"],
       "confidence": "HIGH",
       "rationale": "Source table contains both ACCT_ID and CUST_ID, establishing an account-customer relationship.",
-      "columns": []
+      "columns": [
+        {
+          "column_name": "ACCT_CUST_HK",
+          "logical_name": "Account Customer Hash Key",
+          "data_type": "BINARY(32)",
+          "column_role": "HK",
+          "is_nullable": false,
+          "column_definition": "SHA2_BINARY(256) of ACCOUNT_HK || CUSTOMER_HK."
+        },
+        {
+          "column_name": "ACCOUNT_HK",
+          "logical_name": "Account Hash Key",
+          "data_type": "BINARY(32)",
+          "column_role": "FK_HK",
+          "is_nullable": false,
+          "column_definition": "FK reference to HUB_ACCOUNT."
+        },
+        {
+          "column_name": "CUSTOMER_HK",
+          "logical_name": "Customer Hash Key",
+          "data_type": "BINARY(32)",
+          "column_role": "FK_HK",
+          "is_nullable": false,
+          "column_definition": "FK reference to HUB_CUSTOMER."
+        },
+        {
+          "column_name": "LOAD_DTS",
+          "logical_name": "Load Date Timestamp",
+          "data_type": "TIMESTAMP_NTZ",
+          "column_role": "META",
+          "is_nullable": false,
+          "column_definition": "Load timestamp."
+        },
+        {
+          "column_name": "REC_SRC",
+          "logical_name": "Record Source",
+          "data_type": "VARCHAR(100)",
+          "column_role": "META",
+          "is_nullable": false,
+          "column_definition": "Source system code."
+        },
+        {
+          "column_name": "BATCH_ID",
+          "logical_name": "Batch Identifier",
+          "data_type": "VARCHAR(100)",
+          "column_role": "META",
+          "is_nullable": false,
+          "column_definition": "Pipeline batch/run identifier."
+        }
+      ]
     }
   ],
   "satellites": [
     {
-      "entity_id": "SAT_CUSTOMER_DETAILS__ACCT_SYS",
+      "entity_id": "SAT_CUSTOMER_DTL__ACCT_SYS",
       "is_new": true,
       "parent_entity_id": "HUB_CUSTOMER",
       "satellite_type": "SAT | MSAT | ESAT",
@@ -330,7 +379,80 @@ You MUST return a single valid JSON object — no markdown, no explanation outsi
       "change_frequency": "SLOW | FAST | STATIC | UNKNOWN",
       "confidence": "MEDIUM",
       "rationale": "Slow-changing descriptive attributes from account system. Profiling shows <5% change rate.",
-      "columns": []
+      "columns": [
+        {
+          "column_name": "CUSTOMER_HK",
+          "logical_name": "Customer Hash Key",
+          "data_type": "BINARY(32)",
+          "column_role": "FK_HK",
+          "is_nullable": false,
+          "column_definition": "FK to HUB_CUSTOMER. Part of composite PK.",
+          "source_column": ""
+        },
+        {
+          "column_name": "LOAD_DTS",
+          "logical_name": "Load Date Timestamp",
+          "data_type": "TIMESTAMP_NTZ",
+          "column_role": "META",
+          "is_nullable": false,
+          "column_definition": "Load timestamp. Part of composite PK.",
+          "source_column": ""
+        },
+        {
+          "column_name": "SAT_CUST_DTL_HASHDIFF",
+          "logical_name": "Customer Detail Hashdiff",
+          "data_type": "BINARY(32)",
+          "column_role": "HASHDIFF",
+          "is_nullable": false,
+          "column_definition": "SHA2_BINARY(256) hash of all descriptive columns.",
+          "source_column": ""
+        },
+        {
+          "column_name": "REC_SRC",
+          "logical_name": "Record Source",
+          "data_type": "VARCHAR(100)",
+          "column_role": "META",
+          "is_nullable": false,
+          "column_definition": "Source system code.",
+          "source_column": ""
+        },
+        {
+          "column_name": "BATCH_ID",
+          "logical_name": "Batch Identifier",
+          "data_type": "VARCHAR(100)",
+          "column_role": "META",
+          "is_nullable": false,
+          "column_definition": "Pipeline batch/run identifier.",
+          "source_column": ""
+        },
+        {
+          "column_name": "FRST_NM",
+          "logical_name": "First Name",
+          "data_type": "VARCHAR(100)",
+          "column_role": "ATTR",
+          "is_nullable": true,
+          "column_definition": "Customer first name.",
+          "source_column": "FRST_NM"
+        },
+        {
+          "column_name": "LAST_NM",
+          "logical_name": "Last Name",
+          "data_type": "VARCHAR(100)",
+          "column_role": "ATTR",
+          "is_nullable": true,
+          "column_definition": "Customer last name.",
+          "source_column": "LAST_NM"
+        },
+        {
+          "column_name": "EMAIL_ADDR",
+          "logical_name": "Email Address",
+          "data_type": "VARCHAR(200)",
+          "column_role": "ATTR",
+          "is_nullable": true,
+          "column_definition": "Customer email address.",
+          "source_column": "EMAIL_ADDR"
+        }
+      ]
     }
   ],
   "hash_definitions": [
@@ -350,9 +472,9 @@ You MUST return a single valid JSON object — no markdown, no explanation outsi
 
 Rules for the response:
 - Return ONLY the JSON object — no text before or after
-- Include ALL detected hubs, links, and satellites
-- For entities reused from the registry: set "is_new": false and include the existing entity_id
-- Include ALL columns including metadata columns (HK, BK, LOAD_DTS, REC_SRC, HASHDIFF)
+- CRITICAL: The columns array must NEVER be empty for ANY entity — not for hubs, not for links, not for satellites
+- Include ALL columns: structural metadata columns (HK, FK_HK, HASHDIFF, LOAD_DTS, REC_SRC, BATCH_ID) AND every source attribute column (ATTR/BK) mapped to this entity
+- For registry reused hubs (is_new=false): still include the full columns list — the modeler needs to see all columns for review
 - Every hub, link, and satellite must have a "rationale" explaining the decision
 - Every entity must have a "confidence" value — be honest about uncertainty
 - Use the "warnings" array to flag: low confidence decisions, possible hub reuse not confirmed, composite key decisions, missing profiling data

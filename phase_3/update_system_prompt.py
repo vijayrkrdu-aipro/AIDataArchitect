@@ -8,6 +8,12 @@ Update META.DV_AI_SYSTEM_PROMPT and META.DV_ABBREVIATION with:
 import snowflake.connector
 import os
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+except ImportError:
+    pass
+
 ACCOUNT   = os.environ["SNOWFLAKE_ACCOUNT"]
 USER      = os.environ["SNOWFLAKE_USER"]
 PASSWORD  = os.environ["SNOWFLAKE_PASSWORD"]
@@ -414,9 +420,10 @@ INFERENCE PRIORITY (highest to lowest — honour this order strictly):
           "column_name": "CUSTOMER_HK",
           "logical_name": "Customer Hash Key",
           "data_type": "BINARY(32)",
-          "column_role": "HK",
+          "column_role": "FK_HK",
           "is_nullable": false,
-          "column_definition": "FK to HUB_CUSTOMER. Part of composite PK."
+          "column_definition": "FK to HUB_CUSTOMER. Part of composite PK.",
+          "source_column": ""
         },
         {
           "column_name": "LOAD_DTS",
@@ -424,7 +431,8 @@ INFERENCE PRIORITY (highest to lowest — honour this order strictly):
           "data_type": "TIMESTAMP_NTZ",
           "column_role": "META",
           "is_nullable": false,
-          "column_definition": "Load timestamp. Part of composite PK."
+          "column_definition": "Load timestamp. Part of composite PK.",
+          "source_column": ""
         },
         {
           "column_name": "SAT_CUST_DTL_HASHDIFF",
@@ -432,7 +440,8 @@ INFERENCE PRIORITY (highest to lowest — honour this order strictly):
           "data_type": "BINARY(32)",
           "column_role": "HASHDIFF",
           "is_nullable": false,
-          "column_definition": "SHA2_BINARY(256) hash of all descriptive columns."
+          "column_definition": "SHA2_BINARY(256) hash of all descriptive columns.",
+          "source_column": ""
         },
         {
           "column_name": "REC_SRC",
@@ -440,7 +449,8 @@ INFERENCE PRIORITY (highest to lowest — honour this order strictly):
           "data_type": "VARCHAR(50)",
           "column_role": "META",
           "is_nullable": false,
-          "column_definition": "Source system code."
+          "column_definition": "Source system code.",
+          "source_column": ""
         },
         {
           "column_name": "BATCH_ID",
@@ -448,7 +458,35 @@ INFERENCE PRIORITY (highest to lowest — honour this order strictly):
           "data_type": "VARCHAR(100)",
           "column_role": "META",
           "is_nullable": false,
-          "column_definition": "Pipeline batch/run identifier."
+          "column_definition": "Pipeline batch/run identifier.",
+          "source_column": ""
+        },
+        {
+          "column_name": "FRST_NM",
+          "logical_name": "First Name",
+          "data_type": "VARCHAR(100)",
+          "column_role": "ATTR",
+          "is_nullable": true,
+          "column_definition": "Customer first name.",
+          "source_column": "FRST_NM"
+        },
+        {
+          "column_name": "LAST_NM",
+          "logical_name": "Last Name",
+          "data_type": "VARCHAR(100)",
+          "column_role": "ATTR",
+          "is_nullable": true,
+          "column_definition": "Customer last name.",
+          "source_column": "LAST_NM"
+        },
+        {
+          "column_name": "EMAIL_ADDR",
+          "logical_name": "Email Address",
+          "data_type": "VARCHAR(200)",
+          "column_role": "ATTR",
+          "is_nullable": true,
+          "column_definition": "Customer email address.",
+          "source_column": "EMAIL_ADDR"
         }
       ]
     }
@@ -479,8 +517,9 @@ INFERENCE PRIORITY (highest to lowest — honour this order strictly):
 
 Rules:
 - Return ONLY the JSON object — no text before or after
-- Include ALL hubs, links, and satellites with full column lists including metadata columns
-- For registry reused entities: set is_new=false, include entity_id, omit columns list
+- CRITICAL: The columns array must NEVER be empty for ANY entity — not for hubs, not for links, not for satellites
+- Include ALL columns: structural metadata columns (HK, FK_HK, HASHDIFF, LOAD_DTS, REC_SRC, BATCH_ID) AND every source attribute column (ATTR/BK) mapped to this entity
+- For registry reused hubs (is_new=false): still include the full columns list — the modeler needs to see all columns for review
 - Every entity MUST have rationale and confidence
 - simplification_notes MUST explain any consolidation, hub reuse, or name abbreviation decisions
 - warnings array flags low-confidence decisions, composite key uncertainty, missing data

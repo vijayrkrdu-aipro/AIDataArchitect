@@ -31,7 +31,7 @@ st.sidebar.markdown(
     unsafe_allow_html=True
 )
 page = st.sidebar.radio("",
-    ["Identify Source", "Profile and Review", "Design Raw Vault", "Generate Model", "Generate dbt"],
+    ["Identify Source", "Profile and Review", "Design Raw Vault", "Generate Erwin", "Generate DBT"],
     key="nav", label_visibility="collapsed")
 
 # ── Cached data loaders ───────────────────────────────────────────────────────
@@ -1583,6 +1583,19 @@ def _ws_key(*parts):
     """Generate a unique session-state key from parts."""
     return "__wb_" + "_".join(str(p) for p in parts)
 
+def _clear_wb_widget_state():
+    """
+    Remove all workbench widget keys (__wb_*) from Streamlit session state.
+    Must be called before loading a new workspace so that stale delete-checkbox
+    states from the previous workspace do not silently filter out columns when
+    the user saves.  (Streamlit preserves widget state by key across reruns, so
+    a del-checkbox that was True in workspace A would still be True for the same
+    key position in workspace B unless explicitly cleared.)
+    """
+    stale = [k for k in st.session_state if k.startswith("__wb_")]
+    for k in stale:
+        del st.session_state[k]
+
 def _get_source_columns(run_id: str) -> list:
     """Return [(col_name, inferred_dtype), ...] from profiling results for a run."""
     if not run_id:
@@ -1817,7 +1830,7 @@ def _render_entity_card(ws: dict, entity_list_key: str, idx: int,
 
         # ── Columns table ─────────────────────────────────────────────────────
         st.markdown("**Columns**")
-        cols = ent.get('columns', [])
+        cols = ent.get('columns') or []   # `or []` guards against explicit None
         role_opts = ['HK', 'BK', 'FK_HK', 'HASHDIFF', 'META', 'ATTR', 'MAK']
 
         # Header row
@@ -1964,6 +1977,8 @@ def page_design_workbench():
         'wb_flow':           None,    # 'modeled' | 'profiled'
         'wb_profiled_meta':  {},
         'wb_source_cols':    [],      # [(col_name, dtype), ...] for add-column dropdown
+        'wb_ai_model':       'claude-opus-4-6',
+        'wb_ai_model_idx':   2,       # index into DV_DESIGN_MODELS (opus = index 2)
     }.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -2046,6 +2061,26 @@ def page_design_workbench():
         ORDER BY ls.LAST_PROFILED DESC
     """).to_pandas()
 
+    # ── AI model selector ─────────────────────────────────────────────────────
+    DV_DESIGN_MODELS = {
+        "Claude Haiku 4.5  (fastest)":       "claude-haiku-4-5",
+        "Claude Sonnet 4.6  (balanced)":     "claude-sonnet-4-6",
+        "Claude Opus 4.6  (best quality)":   "claude-opus-4-6",
+        "Llama 3.1 405B  (open source)":     "llama3.1-405b",
+        "OpenAI GPT-5.1":                    "openai-gpt-5.1",
+    }
+    _wb_model_label = st.radio(
+        "AI Model for Vault Generation",
+        list(DV_DESIGN_MODELS.keys()),
+        index=st.session_state.get("wb_ai_model_idx", 2),
+        horizontal=True,
+        key="wb_ai_model_radio",
+        help="Model used when generating or re-generating a Raw Vault proposal."
+    )
+    st.session_state["wb_ai_model_idx"] = list(DV_DESIGN_MODELS.keys()).index(_wb_model_label)
+    st.session_state["wb_ai_model"]     = DV_DESIGN_MODELS[_wb_model_label]
+    _wb_model_id = DV_DESIGN_MODELS[_wb_model_label]
+
     col_explorer, col_main = st.columns([1, 3])
 
     # ══ LEFT PANEL: SOURCE TABLES ═════════════════════════════════════════════
@@ -2085,6 +2120,7 @@ def page_design_workbench():
                                   disabled=True, key="wb_mg_created")
                     if st.button("Open Model →", use_container_width=True, key="wb_mg_open"):
                         run_id_for_cols = row.get('LATEST_RUN_ID')
+                        _clear_wb_widget_state()
                         st.session_state.wb_workspace_id  = row['WORKSPACE_ID']
                         st.session_state.wb_workspace     = None
                         st.session_state.wb_source_key    = (
@@ -2138,7 +2174,8 @@ def page_design_workbench():
                                 pnm_row['SOURCE_SYSTEM'],
                                 pnm_row.get('SOURCE_SCHEMA') or None,
                                 src_db_direct, None,
-                                _merge_vault_notes(_pnm_src_key)
+                                _merge_vault_notes(_pnm_src_key),
+                                _wb_model_id
                             )
                             lr_direct = session.sql(f"""
                                 SELECT RUN_ID FROM META.DV_PROFILING_RUN
@@ -2149,6 +2186,7 @@ def page_design_workbench():
                             """).collect()
                             st.session_state.wb_source_cols   = (
                                 _get_source_columns(lr_direct[0]['RUN_ID']) if lr_direct else [])
+                            _clear_wb_widget_state()
                             st.session_state.wb_workspace_id  = ws_id_direct
                             st.session_state.wb_workspace     = None
                             st.session_state.wb_source_key    = (
@@ -2220,7 +2258,8 @@ def page_design_workbench():
                             pm['source_table'], pm['source_system'],
                             pm.get('source_schema') or None,
                             src_db_param, None,
-                            _merge_vault_notes(_profiled_src_key, _user_notes)
+                            _merge_vault_notes(_profiled_src_key, _user_notes),
+                            _wb_model_id
                         )
                         # Pre-cache source cols from profiling run
                         lr = session.sql(f"""
@@ -2232,6 +2271,7 @@ def page_design_workbench():
                         """).collect()
                         st.session_state.wb_source_cols = (
                             _get_source_columns(lr[0]['RUN_ID']) if lr else [])
+                        _clear_wb_widget_state()
                         st.session_state.wb_workspace_id  = ws_id_new
                         st.session_state.wb_workspace     = None
                         st.session_state.wb_flow          = 'modeled'
@@ -2283,13 +2323,45 @@ def page_design_workbench():
                          any('could not be parsed' in (w or '').lower()
                              for w in ws.get('warnings', [])))
         if _parse_failed:
+            # Auto-regenerate on first open — keyed per workspace so it fires
+            # exactly once, then falls back to manual UI if it also fails.
+            _auto_key = f"__wb_auto_regen_{ws_id}"
+            if not st.session_state.get(_auto_key):
+                st.session_state[_auto_key] = True
+                _auto_src_key = f"{src_sys}__{src_tbl}"
+                _auto_notes   = (meta.get('modeler_notes', '') or '').strip()
+                with st.spinner(
+                    "Previous AI response had a formatting error — "
+                    "auto-recovering with a fresh generation…"):
+                    try:
+                        if ws_id:
+                            session.sql(f"""
+                                UPDATE META.DV_DESIGN_WORKSPACE SET STATUS='SUPERSEDED'
+                                WHERE WORKSPACE_ID='{ws_id.replace("'","''")}'
+                            """).collect()
+                        _auto_id = session.call(
+                            "META.SP_GENERATE_DV_PROPOSAL",
+                            src_tbl, src_sys,
+                            meta.get('source_schema'), None, None,
+                            _merge_vault_notes(_auto_src_key, _auto_notes),
+                            _wb_model_id
+                        )
+                        _clear_wb_widget_state()
+                        st.session_state.wb_workspace_id = _auto_id
+                        st.session_state.wb_workspace    = None
+                        st.session_state.wb_source_cols  = []
+                        st.experimental_rerun()
+                    except Exception:
+                        pass  # auto-regen failed — fall through to manual UI
+
+            # Manual fallback (shown if auto-regen itself failed)
             parse_warn = next(
                 (w for w in ws.get('warnings', []) if 'could not be parsed' in (w or '').lower()),
                 '')
-            st.error("The AI response could not be parsed into a DV model. "
-                     "Use **Re-generate** below.")
+            st.error("AI response could not be parsed. Auto-recovery also failed.")
             if parse_warn:
-                st.caption(f"Parse error detail: {parse_warn}")
+                with st.expander("Technical detail"):
+                    st.caption(parse_warn)
             raw_snippet = ws.get('_raw_ai_response', '')
             if raw_snippet:
                 with st.expander("Show raw AI response (for diagnosis)"):
@@ -2301,7 +2373,17 @@ def page_design_workbench():
                 placeholder="Leave blank to re-use the original instructions.")
             if st.button("🔄 Re-generate", use_container_width=True, key="wb_err_regen_btn"):
                 _err_src_key = f"{src_sys}__{src_tbl}"
-                _err_modeler = (existing_notes.strip() + '\n' + regen_notes_err.strip()).strip()
+                _err_new  = regen_notes_err.strip()
+                _err_old  = existing_notes.strip()
+                if _err_new and _err_old:
+                    _err_modeler = (
+                        f"CHANGE REQUEST (OVERRIDE — APPLY EXACTLY AS STATED):\n{_err_new}"
+                        f"\n\nORIGINAL MODELER NOTES (still apply unless contradicted above):\n{_err_old}"
+                    )
+                elif _err_new:
+                    _err_modeler = _err_new
+                else:
+                    _err_modeler = _err_old
                 _new_ws_id = None
                 _regen_err = None
                 with st.spinner("Calling Cortex AI… this may take 30–60 seconds"):
@@ -2315,13 +2397,15 @@ def page_design_workbench():
                             "META.SP_GENERATE_DV_PROPOSAL",
                             src_tbl, src_sys,
                             meta.get('source_schema'), None, None,
-                            _merge_vault_notes(_err_src_key, _err_modeler)
+                            _merge_vault_notes(_err_src_key, _err_modeler),
+                            _wb_model_id
                         )
                     except Exception as e:
                         _regen_err = str(e)
                 if _regen_err:
                     st.error(f"Re-generation failed: {_regen_err}")
                 elif _new_ws_id:
+                    _clear_wb_widget_state()
                     st.session_state.wb_workspace_id = _new_ws_id
                     st.session_state.wb_workspace    = None
                     st.session_state.wb_source_cols  = []
@@ -2457,8 +2541,17 @@ def page_design_workbench():
                 if regen_c1.button("🔄 Re-generate",
                                    use_container_width=True, key="wb_regen"):
                     _regen_src_key = f"{src_sys}__{src_tbl}"
-                    _regen_modeler = (meta.get('modeler_notes', '') or '') + \
-                                     ('\n' if regen_notes.strip() else '') + regen_notes.strip()
+                    _regen_new = regen_notes.strip()
+                    _regen_old = (meta.get('modeler_notes', '') or '').strip()
+                    if _regen_new and _regen_old:
+                        _regen_modeler = (
+                            f"CHANGE REQUEST (OVERRIDE — APPLY EXACTLY AS STATED):\n{_regen_new}"
+                            f"\n\nORIGINAL MODELER NOTES (still apply unless contradicted by the change request above):\n{_regen_old}"
+                        )
+                    elif _regen_new:
+                        _regen_modeler = _regen_new
+                    else:
+                        _regen_modeler = _regen_old
                     _regen_id = None
                     _regen_err2 = None
                     with st.spinner("Calling Cortex AI… this may take 30–60 seconds"):
@@ -2473,13 +2566,15 @@ def page_design_workbench():
                                 "META.SP_GENERATE_DV_PROPOSAL",
                                 src_tbl, src_sys,
                                 meta.get('source_schema'), None, None,
-                                _merge_vault_notes(_regen_src_key, _regen_modeler)
+                                _merge_vault_notes(_regen_src_key, _regen_modeler),
+                                _wb_model_id
                             )
                         except Exception as e:
                             _regen_err2 = str(e)
                     if _regen_err2:
                         st.error(f"Re-generation failed: {_regen_err2}")
                     elif _regen_id:
+                        _clear_wb_widget_state()
                         st.session_state.wb_workspace_id = _regen_id
                         st.session_state.wb_workspace    = None
                         st.session_state.wb_source_cols  = []
@@ -2517,7 +2612,7 @@ def page_design_workbench():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 4: GENERATE MODEL
+# PAGE 4: Generate Erwin
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _topo_sort_entities(entities: list) -> list:
@@ -2612,7 +2707,7 @@ def _build_erwin_rows(ent: dict, cols: list) -> list:
 
 
 def page_generate_model():
-    st.title("Generate Model")
+    st.title("Generate Erwin")
     st.caption("Choose source tables with approved DV proposals, set a target schema, then generate DDL.")
 
     # ── Load approved workspace→entity mapping ────────────────────────────────
@@ -3053,11 +3148,11 @@ def page_generate_model():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 5: GENERATE dbt
+# PAGE 5: Generate DBT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def page_generate_dbt():
-    st.title("Generate dbt")
+    st.title("Generate DBT")
     st.caption(
         "Generate all dbt model files needed to load your approved Raw Vault using automate_dv. "
         "Copy each file into your NexusDBT project in the Snowflake dbt IDE."
@@ -3677,7 +3772,7 @@ elif page == "Profile and Review":
     page_profiling_review()
 elif page == "Design Raw Vault":
     page_design_workbench()
-elif page == "Generate Model":
+elif page == "Generate Erwin":
     page_generate_model()
-elif page == "Generate dbt":
+elif page == "Generate DBT":
     page_generate_dbt()

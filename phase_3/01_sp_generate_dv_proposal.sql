@@ -22,7 +22,8 @@ CREATE OR REPLACE PROCEDURE META.SP_GENERATE_DV_PROPOSAL(
     SOURCE_SCHEMA    VARCHAR DEFAULT NULL,
     SOURCE_DATABASE  VARCHAR DEFAULT NULL,
     RUN_ID           VARCHAR DEFAULT NULL,
-    MODELER_NOTES    VARCHAR DEFAULT NULL
+    MODELER_NOTES    VARCHAR DEFAULT NULL,
+    AI_MODEL         VARCHAR DEFAULT 'claude-opus-4-6'
 )
 RETURNS VARCHAR
 LANGUAGE PYTHON
@@ -41,7 +42,8 @@ def run(session,
         source_schema:   str = None,
         source_database: str = None,
         run_id:          str = None,
-        modeler_notes:   str = None) -> str:
+        modeler_notes:   str = None,
+        ai_model:        str = 'claude-opus-4-6') -> str:
 
     # ── IDs ───────────────────────────────────────────────────────────────────
     proposal_id  = str(uuid.uuid4())
@@ -297,6 +299,9 @@ Instructions for using these notes:
 - Any column marked as deprecated or to-be-ignored must be EXCLUDED from all vault entities.
 - Any relationship to another table mentioned here means you MUST propose a link to that entity.
 - Any statement about table purpose directly guides which hub(s) to create.
+- CHANGE REQUEST or OVERRIDE label: If the notes contain a section labelled "CHANGE REQUEST" or "OVERRIDE", apply it literally and exactly. It takes precedence over every AI default rule, including simplification guardrails.
+- Any explicit instruction about the NUMBER of satellites, hubs, or links (e.g. "create 3 satellites", "split into 2 satellites") OVERRIDES all simplification and consolidation guardrails. Produce exactly the count and structure stated — no more, no less.
+- Any structural instruction (split/merge/add/remove entities, move columns between satellites) must be applied exactly as written, regardless of what the profiling data suggests.
 - In every entity rationale, explicitly state which part of the modeler notes influenced that decision.
 === END MODELER NOTES ==="""
     else:
@@ -316,7 +321,7 @@ Instructions for using these notes:
 INSTRUCTIONS:
 1. Read the MODELER NOTES above before doing anything else. Apply every instruction in them.
 2. Check the EXISTING APPROVED REGISTRY for hub reuse opportunities before creating any new hub.
-3. Apply the satellite simplification guardrails: consolidate where possible, avoid over-splitting.
+3. Apply the satellite simplification guardrails: consolidate where possible, avoid over-splitting. EXCEPTION: If MODELER NOTES specify an explicit satellite count, structure, or a CHANGE REQUEST, ignore these guardrails entirely and follow the modeler instruction exactly.
 4. Apply entity naming conventions: SAT_<SRCCODE>_<NOUN>_<DESC> — source system code comes FIRST after SAT_, single underscore throughout. Max 5-char source code. Same pattern for MSAT and ESAT. Examples: SAT_ACCTS_CUSTOMER_DETAILS, MSAT_ACCTS_CUSTOMER_PHONE, ESAT_ACCTS_ACCOUNT_CUSTOMER.
 5. CRITICAL — SOURCE COLUMN NAMES: For every attribute (column_role: ATTR) and business key (column_role: BK) column,
    the "column_name" field MUST be identical to the source column name as it appears in the profiling data.
@@ -335,18 +340,28 @@ INSTRUCTIONS:
     # ── 7. Call Cortex AI_COMPLETE ─────────────────────────────────────────────
     # max_tokens inlined as a literal (not a bind param) — Snowflake requires
     # the options object to be a literal or OBJECT_CONSTRUCT, not PARSE_JSON(?).
+    # Different models have different max_tokens caps; exceed them and Cortex errors.
+    _MODEL_MAX_TOKENS = {
+        'claude-haiku-4-5':  16000,
+        'claude-sonnet-4-6': 20000,
+        'claude-opus-4-6':   20000,
+        'llama3.1-405b':      8192,
+        'openai-gpt-5.1':     8192,
+    }
+    _max_tokens = _MODEL_MAX_TOKENS.get(ai_model or 'claude-opus-4-6', 8192)
+
     messages_json = json.dumps([
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_message}
     ], ensure_ascii=True)
 
     ai_row = session.sql(
-        """SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
+        f"""SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
                ?,
                PARSE_JSON(?),
-               OBJECT_CONSTRUCT('max_tokens', 20000, 'temperature', 0)
+               OBJECT_CONSTRUCT('max_tokens', {_max_tokens}, 'temperature', 0)
            )::VARCHAR AS AI_RESPONSE""",
-        params=["claude-opus-4-6", messages_json]
+        params=[ai_model or "claude-opus-4-6", messages_json]
     ).collect()
 
     # SNOWFLAKE.CORTEX.AI_COMPLETE(...)::VARCHAR returns the content string directly
@@ -495,11 +510,39 @@ INSTRUCTIONS:
         except Exception as e3:
             last_err = str(e3)
 
-        # Pass 4: truncation recovery — close any open braces/brackets then retry
-        t4 = _repair_truncated(t3)
-        t4 = re.sub(r',(\s*[}\]])', r'\1', t4)   # trailing commas on repaired text
+        # Pass 4: sanitize literal control characters inside JSON strings
+        # Handles "Expecting ',' delimiter" errors caused by unescaped newlines,
+        # tabs, or carriage returns that the AI embeds inside string values.
+        def _sanitize_strings(s):
+            out, in_str, esc = [], False, False
+            for ch in s:
+                if esc:
+                    out.append(ch); esc = False; continue
+                if ch == '\\' and in_str:
+                    out.append(ch); esc = True; continue
+                if ch == '"':
+                    in_str = not in_str; out.append(ch); continue
+                if in_str and ord(ch) < 32:
+                    if   ch == '\n': out.append('\\n')
+                    elif ch == '\r': out.append('\\r')
+                    elif ch == '\t': out.append('\\t')
+                    else:            out.append(f'\\u{ord(ch):04x}')
+                else:
+                    out.append(ch)
+            return ''.join(out)
+
+        t4 = _sanitize_strings(t3)
+        t4 = re.sub(r',(\s*[}\]])', r'\1', t4)
         try:
-            result = json.loads(t4)
+            return json.loads(t4), None
+        except Exception as e4:
+            last_err = str(e4)
+
+        # Pass 5: truncation recovery — close any open braces/brackets then retry
+        t5 = _repair_truncated(t4)
+        t5 = re.sub(r',(\s*[}\]])', r'\1', t5)   # trailing commas on repaired text
+        try:
+            result = json.loads(t5)
             # Mark that we recovered from truncation so a warning is attached
             if isinstance(result, dict):
                 result.setdefault('warnings', []).append(
@@ -507,8 +550,8 @@ INSTRUCTIONS:
                     'Some columns or entities near the end may be missing. '
                     'Consider re-generating.')
             return result, None
-        except Exception as e4:
-            last_err = str(e4)
+        except Exception as e5:
+            last_err = str(e5)
 
         return None, last_err
 
@@ -525,7 +568,7 @@ INSTRUCTIONS:
                                        f"Raw response length: {len(ai_text)} chars. Manual review required."],
                 "hubs": [], "links": [], "satellites": [],
                 "hash_definitions": [],
-                "_raw_ai_response": ai_text[:8000]
+                "_raw_ai_response": ai_text[:20000]
             }
     else:
         # AI returned empty response
@@ -547,9 +590,9 @@ INSTRUCTIONS:
                (PROPOSAL_ID, SOURCE_SYSTEM, SOURCE_SCHEMA, SOURCE_TABLE,
                 RUN_ID, INPUT_SCENARIO, AI_MODEL, PROMPT_VERSION,
                 PROPOSAL_JSON, CONFIDENCE, STATUS)
-           SELECT ?, ?, ?, ?, ?, ?, 'claude-opus-4-6', ?, PARSE_JSON(?), ?, 'PENDING'""",
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, PARSE_JSON(?), ?, 'PENDING'""",
         params=[proposal_id, source_system, source_schema, source_table,
-                run_id, input_scenario, prompt_version,
+                run_id, input_scenario, ai_model or "claude-opus-4-6", prompt_version,
                 proposal_json, confidence_overall]
     ).collect()
 

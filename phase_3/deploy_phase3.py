@@ -2,6 +2,12 @@
 import snowflake.connector
 import os
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+except ImportError:
+    pass
+
 ACCOUNT   = os.environ["SNOWFLAKE_ACCOUNT"]
 USER      = os.environ["SNOWFLAKE_USER"]
 PASSWORD  = os.environ["SNOWFLAKE_PASSWORD"]
@@ -24,7 +30,13 @@ cs = conn.cursor()
 
 try:
     # ── 1. Deploy SP_GENERATE_DV_PROPOSAL ────────────────────────────────────
+    # Drop old 6-arg signature first to avoid Snowflake overload ambiguity
+    # (adding AI_MODEL as 7th param with default would otherwise conflict)
     print("1. Deploying SP_GENERATE_DV_PROPOSAL...")
+    cs.execute("""
+        DROP PROCEDURE IF EXISTS META.SP_GENERATE_DV_PROPOSAL(
+            VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR)
+    """)
     sp_file = os.path.join(PHASE3_DIR, '01_sp_generate_dv_proposal.sql')
     with open(sp_file, 'r', encoding='utf-8') as f:
         sp_sql = f.read()

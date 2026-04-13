@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(pip install:*)",
-      "Bash(python build_ppt.py)"
+      "Bash(python build_ppt.py)",
+      "Bash(python phase_3/update_system_prompt.py)"
     ]
   }
 }
